@@ -65,7 +65,7 @@ int main() {
     // Parse the info
     char method[8];
     char path[256];
-    scanf(buffer, "%s, %s", method, path);
+    sscanf(buffer, "%s %s", method, path);
     
     // Set the response
     char response[1024];
@@ -74,8 +74,16 @@ int main() {
     } else {
         snprintf(response, sizeof(response), "HTTP/1.1 404 Not Found\r\n\r\n");
     }
-    send(fd, response, strlen(response), 0);
+    int bytes_sent = send(fd, response, strlen(response), 0);
+    if (bytes_sent == -1){
+      printf("Send failed %s \n", strerror(errno));
+      return 1;
+    }
+  } else {
+    printf("Recv failed: %s \n", strerror(errno));
+    return 1;
   }
+
   
 	close(server_fd);
 
