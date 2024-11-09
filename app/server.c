@@ -15,9 +15,8 @@ int main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	printf("Logs from your program will appear here!\n");
 
-	// Uncomment this block to pass the first stage
-
-	int server_fd, client_addr_len;
+	int server_fd;
+  socklen_t client_addr_len;
 	struct sockaddr_in client_addr;
 
 	server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -34,10 +33,11 @@ int main() {
 		return 1;
 	}
 
-	struct sockaddr_in serv_addr = { .sin_family = AF_INET ,
-									 .sin_port = htons(4221),
-									 .sin_addr = { htonl(INADDR_ANY) },
-									};
+	struct sockaddr_in serv_addr = { 
+   .sin_family = AF_INET , // IPv4
+	 .sin_port = htons(4221), //port: 4221
+	 .sin_addr = { htonl(INADDR_ANY) }, // Any IP available
+	};
 
 	if (bind(server_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0) {
 		printf("Bind failed: %s \n", strerror(errno));
@@ -53,12 +53,30 @@ int main() {
 	printf("Waiting for a client to connect...\n");
 	client_addr_len = sizeof(client_addr);
 
-	// accept(server_fd, (struct sockaddr *) &client_addr, &client_addr_len);
   int fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
 	printf("Client connected\n");
-  char response[] = "HTTP/1.1 200 OK\r\n\r\n";
-  int bytes_sent = send(fd, response, strlen(response), 0);
 
+  // Receive the Request
+  char buffer[1024];
+  int bytes_received = recv(fd, buffer, sizeof(buffer) - 1,0);
+  if (bytes_received > 0) {
+    buffer[bytes_received] = '\0';
+
+    // Parse the info
+    char method[8];
+    char path[256];
+    scanf(buffer, "%s, %s", method, path);
+    
+    // Set the response
+    char response[1024];
+    if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
+        snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\n\r\n");
+    } else {
+        snprintf(response, sizeof(response), "HTTP/1.1 404 Not Found\r\n\r\n");
+    }
+    send(fd, response, strlen(response), 0);
+  }
+  
 	close(server_fd);
 
 	return 0;
