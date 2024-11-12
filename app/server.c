@@ -77,6 +77,7 @@ int setup_server(int port) {
   return fd;
 }
 
+
 /**
  * @brief Receives an HTTP request from the client, parses the method and path, and sets the appropriate HTTP response.
  *
@@ -86,76 +87,102 @@ int setup_server(int port) {
  * @return int             Returns 0 on successful processing, -1 on failure.
  */
 int process_request(int fd, char *response, size_t response_size) {
-  // Receive the Request
-  char buffer[BUFFER_SIZE];
-  int bytes_received = recv(fd, buffer, sizeof(buffer) - 1, 0);
-  
-  printf("Bytes received: %d\n", bytes_received); // Debug statement
-  
-  if (bytes_received > 0) {
-    buffer[bytes_received] = '\0';
+    // Receive the Request
+    char buffer[BUFFER_SIZE];
+    int bytes_received = recv(fd, buffer, sizeof(buffer) - 1, 0);
 
-    // Parse the info
-    char method[METHOD_SIZE];
-    char path[PATH_SIZE];
-    int sscanf_result = sscanf(buffer, "%7s %255s", method, path);
-    
-    printf("Method: %s, Path: %s\n", method, path); // Debug statement
-    
-    if (sscanf_result != 2) {
-      printf("Failed to parse request.\n");
-      return -1;
-    }
-    
-    // Set the response
-    if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
-        snprintf(response, response_size, "HTTP/1.1 200 OK\r\n"
-                                         "Content-Length: 13\r\n"
-                                         "Content-Type: text/plain\r\n\r\n"
-                                         "Hello, world!");
+    printf("Bytes received: %d\n", bytes_received); // Debug statement
+
+    if (bytes_received > 0) {
+        buffer[bytes_received] = '\0'; // Null-terminate the received data
+
+        // Parse the HTTP method and path
+        char method[METHOD_SIZE];
+        char path[PATH_SIZE];
+        int sscanf_result = sscanf(buffer, "%7s %255s", method, path);
+
+        printf("Method: %s, Path: %s\n", method, path); // Debug statement
+
+        if (sscanf_result != 2) {
+            printf("Failed to parse request.\n");
+            return -1;
+        }
+
+        // Check if the request method is GET
+        if (strcmp(method, "GET") != 0) {
+            // Only handle GET requests; respond with 405 Method Not Allowed
+            snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+            return 0;
+        }
+
+        // Handle the /echo/{str} endpoint
+        if (strncmp(path, "/echo/", 6) == 0) {
+            char *echo_str = path + 6; // Extract the string after "/echo/"
+            size_t echo_len = strlen(echo_str);
+
+            // Construct the HTTP response with headers
+            int ret = snprintf(response, response_size,
+                               "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Content-Length: %zu\r\n"
+                               "\r\n"
+                               "%s",
+                               echo_len, echo_str);
+            if (ret < 0 || (size_t)ret >= response_size) {
+                printf("Failed to construct echo response.\n");
+                return -1;
+            }
+            return 0;
+        }
+        // Handle the root (/) and /index endpoints
+        else if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
+            snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
+            return 0;
+        }
+        // Handle unknown endpoints
+        else {
+            snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+            return 0;
+        }
     } else {
-        snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n"
-                                         "Content-Length: 9\r\n"
-                                         "Content-Type: text/plain\r\n\r\n"
-                                         "Not Found");
+        printf("Recv returned %d: %s\n", bytes_received, strerror(errno)); // Debug statement
+        return -1;
     }
-  } else {
-    printf("Recv returned %d: %s\n", bytes_received, strerror(errno)); // Debug statement
-    return -1;
-  }
-  return 0;
+    return 0;
 }
+
 
 int main() {
   // Disable output buffering
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 
-  // You can use print statements as follows for debugging, they'll be visible when running tests.
-  printf("Logs from your program will appear here!\n");
-  
+  // Setup the Server
   int port = 4221;
-
   int fd = setup_server(port);
   if (fd == -1) {
     printf("Failed to set up server.\n");
     return 1;
   }
 
-  char response[BUFFER_SIZE];
   // Process the client's request
+  char response[BUFFER_SIZE];
   if (process_request(fd, response, sizeof(response)) == -1) {
       printf("Failed to process client request.\n");
       close(fd);
       return 1;
-  }  
+  }
+
+  // Send response
   int bytes_sent = send(fd, response, strlen(response), 0);
   if (bytes_sent == -1){
-    printf("Send failed: %s \n", strerror(errno));
-    return 1;
+      printf("Send failed: %s \n", strerror(errno));
+      return 1;
   } else {
-    printf("Response sent successfully.\n"); // Corrected message
+      printf("Response sent successfully.\n");
   }
+
+  // Close Socket
   close(fd);
   return 0;
 }
