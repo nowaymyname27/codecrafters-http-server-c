@@ -84,7 +84,7 @@ int setup_server(int port) {
  * @param fd              The file descriptor for the connected client socket.
  * @param response        A buffer to store the generated HTTP response.
  * @param response_size   The size of the response buffer to prevent overflow.
- * @return int             Returns 0 on successful processing, -1 on failure.
+ * @return int            Returns 0 on successful processing, -1 on failure.
  */
 int process_request(int fd, char *response, size_t response_size) {
     // Receive the Request
@@ -93,61 +93,116 @@ int process_request(int fd, char *response, size_t response_size) {
 
     printf("Bytes received: %d\n", bytes_received); // Debug statement
 
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0'; // Null-terminate the received data
-
-        // Parse the HTTP method and path
-        char method[METHOD_SIZE];
-        char path[PATH_SIZE];
-        int sscanf_result = sscanf(buffer, "%7s %255s", method, path);
-
-        printf("Method: %s, Path: %s\n", method, path); // Debug statement
-
-        if (sscanf_result != 2) {
-            printf("Failed to parse request.\n");
-            return -1;
-        }
-
-        // Check if the request method is GET
-        if (strcmp(method, "GET") != 0) {
-            // Only handle GET requests; respond with 405 Method Not Allowed
-            snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-            return 0;
-        }
-
-        // Handle the /echo/{str} endpoint
-        if (strncmp(path, "/echo/", 6) == 0) {
-            char *echo_str = path + 6; // Extract the string after "/echo/"
-            size_t echo_len = strlen(echo_str);
-
-            // Construct the HTTP response with headers
-            int ret = snprintf(response, response_size,
-                               "HTTP/1.1 200 OK\r\n"
-                               "Content-Type: text/plain\r\n"
-                               "Content-Length: %zu\r\n"
-                               "\r\n"
-                               "%s",
-                               echo_len, echo_str);
-            if (ret < 0 || (size_t)ret >= response_size) {
-                printf("Failed to construct echo response.\n");
-                return -1;
-            }
-            return 0;
-        }
-        // Handle the root (/) and /index endpoints
-        else if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
-            snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
-            return 0;
-        }
-        // Handle unknown endpoints
-        else {
-            snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
-            return 0;
-        }
-    } else {
-        printf("Recv returned %d: %s\n", bytes_received, strerror(errno)); // Debug statement
+    if (bytes_received <= 0) {
+        printf("Recv returned %d: %s\n", bytes_received, strerror(errno)); // Debug
         return -1;
     }
+
+    // Null-terminate the received data so we can safely use string functions
+    buffer[bytes_received] = '\0';
+
+    // We'll store the method, path, and user-agent
+    char method[METHOD_SIZE] = {0};
+    char path[PATH_SIZE]     = {0};
+    char user_agent[BUFFER_SIZE] = {0};
+
+    // 1. Split the incoming request into lines using strtok
+    //    The first line will be the "request line" (e.g., GET /path HTTP/1.1).
+    char *line = strtok(buffer, "\r\n");
+    if (!line) {
+        printf("Empty request line.\n");
+        return -1;
+    }
+
+    // 2. Parse the request line to extract the method and path
+    int sscanf_result = sscanf(line, "%7s %255s", method, path);
+    if (sscanf_result != 2) {
+        printf("Failed to parse request line.\n");
+        return -1;
+    }
+
+    printf("Method: %s, Path: %s\n", method, path); // Debug
+
+    // 3. Now that we've handled the first line, parse any additional lines as headers
+    while ((line = strtok(NULL, "\r\n")) != NULL) {
+        // A blank line indicates the end of headers; break out of the loop
+        if (strlen(line) == 0) {
+            break;
+        }
+
+        // Look for the User-Agent header (case-insensitive compare for safety)
+        if (strncasecmp(line, "User-Agent:", 11) == 0) {
+            // Skip "User-Agent:"
+            const char *ua_start = line + 11;
+
+            // Trim leading spaces if any
+            while (*ua_start == ' ' || *ua_start == '\t') {
+                ua_start++;
+            }
+
+            // Copy the rest of the line into user_agent buffer
+            strncpy(user_agent, ua_start, sizeof(user_agent) - 1);
+            user_agent[sizeof(user_agent) - 1] = '\0'; // Ensure null-termination
+
+            printf("Parsed User-Agent: %s\n", user_agent); // Debug
+        }
+    }
+
+    // 4. Check the method
+    if (strcmp(method, "GET") != 0) {
+        // Only handle GET requests; respond with 405 Method Not Allowed
+        snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+        return 0;
+    }
+
+    // 5. Handle endpoints
+    if (strncmp(path, "/echo/", 6) == 0) {
+        // /echo/{str}
+        char *echo_str = path + 6; // Extract the string after "/echo/"
+        size_t echo_len = strlen(echo_str);
+
+        // Construct the HTTP response with headers
+        int ret = snprintf(response, response_size,
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           echo_len, echo_str);
+        if (ret < 0 || (size_t)ret >= response_size) {
+            printf("Failed to construct echo response.\n");
+            return -1;
+        }
+        return 0;
+    }
+    else if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
+        // Root or /index
+        snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
+        return 0;
+    }
+    else if (strncmp(path, "/user-agent", 11) == 0) {
+        // If the path is /user-agent, return whatever was parsed from the User-Agent header
+        size_t ua_len = strlen(user_agent);
+
+        int ret = snprintf(response, response_size,
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           ua_len, user_agent);
+        if (ret < 0 || (size_t)ret >= response_size) {
+            printf("Failed to construct user-agent response.\n");
+            return -1;
+        }
+        return 0;
+    }
+    else {
+        // Unknown endpoint
+        snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+        return 0;
+    }
+
     return 0;
 }
 
