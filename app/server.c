@@ -35,7 +35,6 @@ typedef struct {
 /**
  * @brief Reads and parses the HTTP request from the client socket (fd).
  *
- *        (Your existing parse logic, unchanged)
  */
 HttpRequest parse_http_request(int fd, char *response, size_t response_size)
 {
@@ -87,7 +86,6 @@ HttpRequest parse_http_request(int fd, char *response, size_t response_size)
 /**
  * @brief Constructs an HTTP response based on the parsed HttpRequest data.
  *
- *        (Your existing build logic, unchanged)
  */
 int build_http_response(const HttpRequest *req, char *response, size_t response_size)
 {
