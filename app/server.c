@@ -6,162 +6,108 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pthread.h>   // For threading
 
 // Constants
 #define BUFFER_SIZE 1024
 #define METHOD_SIZE 8
 #define PATH_SIZE 256
+#define UA_SIZE 512
 #define BACKLOG 5
 
-// Function Prototypes
-int setup_server(int port);
-int process_request(int fd, char *response, size_t response_size);
+/**
+ * @brief A structure to hold all parsed request data.
+ */
+typedef struct {
+    char method[METHOD_SIZE];
+    char path[PATH_SIZE];
+    char user_agent[UA_SIZE];
+    int  error;  // Non-zero if an error occurred during parsing
+} HttpRequest;
 
 /**
- * @brief Sets up the server by creating, binding, listening, and accepting a connection.
- *
- * @param port The port number to listen on.
- * @return int The client socket file descriptor on success, -1 on failure.
+ * @brief Holds data about a client connection passed to each thread.
  */
-int setup_server(int port) {
-  int server_fd;
-  socklen_t client_addr_len;
-  struct sockaddr_in client_addr;
-
-  server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd == -1) {
-    printf("Socket creation failed: %s...\n", strerror(errno));
-    return -1;
-  }
-
-  // Since the tester restarts your program quite often, setting SO_REUSEADDR
-  // ensures that we don't run into 'Address already in use' errors
-  int reuse = 1;
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-    printf("SO_REUSEADDR failed: %s \n", strerror(errno));
-    close(server_fd);
-    return -1;
-  }
-
-  struct sockaddr_in serv_addr = { 
-    .sin_family = AF_INET, // IPv4
-    .sin_port = htons(port), //port: 4221
-    .sin_addr = { htonl(INADDR_ANY) }, // Any IP available
-  };
-
-  if (bind(server_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0) {
-    printf("Bind failed: %s \n", strerror(errno));
-    close(server_fd);
-    return -1;
-  }
-  
-  if (listen(server_fd, BACKLOG) != 0) {
-    printf("Listen failed: %s \n", strerror(errno));
-    close(server_fd);
-    return -1;
-  }
-
-  printf("Waiting for a client to connect...\n");
-  client_addr_len = sizeof(client_addr);
-
-  int fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-  if (fd == -1) {
-    printf("Accept failed: %s \n", strerror(errno));
-    close(server_fd);
-    return -1;
-  }
-  
-  printf("Client connected\n");
-
-  close(server_fd);
-  return fd;
-}
-
+typedef struct {
+    int fd;
+} ClientData;
 
 /**
- * @brief Receives an HTTP request from the client, parses the method and path, and sets the appropriate HTTP response.
+ * @brief Reads and parses the HTTP request from the client socket (fd).
  *
- * @param fd              The file descriptor for the connected client socket.
- * @param response        A buffer to store the generated HTTP response.
- * @param response_size   The size of the response buffer to prevent overflow.
- * @return int            Returns 0 on successful processing, -1 on failure.
+ *        (Your existing parse logic, unchanged)
  */
-int process_request(int fd, char *response, size_t response_size) {
-    // Receive the Request
-    char buffer[BUFFER_SIZE];
-    int bytes_received = recv(fd, buffer, sizeof(buffer) - 1, 0);
+HttpRequest parse_http_request(int fd, char *response, size_t response_size)
+{
+    HttpRequest request;
+    memset(&request, 0, sizeof(HttpRequest));
 
-    printf("Bytes received: %d\n", bytes_received); // Debug statement
-
+    int bytes_received = recv(fd, response, response_size - 1, 0);
     if (bytes_received <= 0) {
-        printf("Recv returned %d: %s\n", bytes_received, strerror(errno)); // Debug
-        return -1;
+        fprintf(stderr, "recv() error (%d): %s\n", bytes_received, strerror(errno));
+        request.error = 1; 
+        return request; 
     }
+    response[bytes_received] = '\0';
 
-    // Null-terminate the received data so we can safely use string functions
-    buffer[bytes_received] = '\0';
+    printf("Request:\r\n%s", response);
 
-    // We'll store the method, path, and user-agent
-    char method[METHOD_SIZE] = {0};
-    char path[PATH_SIZE]     = {0};
-    char user_agent[BUFFER_SIZE] = {0};
-
-    // 1. Split the incoming request into lines using strtok
-    //    The first line will be the "request line" (e.g., GET /path HTTP/1.1).
-    char *line = strtok(buffer, "\r\n");
+    char *line = strtok(response, "\r\n");
     if (!line) {
-        printf("Empty request line.\n");
-        return -1;
+        fprintf(stderr, "No request line found.\n");
+        request.error = 1;
+        return request;
     }
 
-    // 2. Parse the request line to extract the method and path
-    int sscanf_result = sscanf(line, "%7s %255s", method, path);
-    if (sscanf_result != 2) {
-        printf("Failed to parse request line.\n");
-        return -1;
+    if (sscanf(line, "%7s %255s", request.method, request.path) != 2) {
+        fprintf(stderr, "Failed to parse request line.\n");
+        request.error = 1;
+        return request;
     }
 
-    printf("Method: %s, Path: %s\n", method, path); // Debug
-
-    // 3. Now that we've handled the first line, parse any additional lines as headers
+    // Parse headers
     while ((line = strtok(NULL, "\r\n")) != NULL) {
-        // A blank line indicates the end of headers; break out of the loop
         if (strlen(line) == 0) {
+            // End of headers
             break;
         }
-
-        // Look for the User-Agent header (case-insensitive compare for safety)
         if (strncasecmp(line, "User-Agent:", 11) == 0) {
-            // Skip "User-Agent:"
             const char *ua_start = line + 11;
-
-            // Trim leading spaces if any
             while (*ua_start == ' ' || *ua_start == '\t') {
                 ua_start++;
             }
-
-            // Copy the rest of the line into user_agent buffer
-            strncpy(user_agent, ua_start, sizeof(user_agent) - 1);
-            user_agent[sizeof(user_agent) - 1] = '\0'; // Ensure null-termination
-
-            printf("Parsed User-Agent: %s\n", user_agent); // Debug
+            strncpy(request.user_agent, ua_start, UA_SIZE - 1);
+            request.user_agent[UA_SIZE - 1] = '\0';
         }
     }
 
-    // 4. Check the method
-    if (strcmp(method, "GET") != 0) {
-        // Only handle GET requests; respond with 405 Method Not Allowed
-        snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+    return request;  // .error = 0 if successful
+}
+
+/**
+ * @brief Constructs an HTTP response based on the parsed HttpRequest data.
+ *
+ *        (Your existing build logic, unchanged)
+ */
+int build_http_response(const HttpRequest *req, char *response, size_t response_size)
+{
+    if (req->error) {
+        snprintf(response, response_size,
+                 "HTTP/1.1 400 Bad Request\r\n\r\n");
         return 0;
     }
 
-    // 5. Handle endpoints
-    if (strncmp(path, "/echo/", 6) == 0) {
-        // /echo/{str}
-        char *echo_str = path + 6; // Extract the string after "/echo/"
+    if (strcmp(req->method, "GET") != 0) {
+        snprintf(response, response_size,
+                 "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+        return 0;
+    }
+
+    // /echo/{str}
+    if (strncmp(req->path, "/echo/", 6) == 0) {
+        const char *echo_str = req->path + 6;
         size_t echo_len = strlen(echo_str);
 
-        // Construct the HTTP response with headers
         int ret = snprintf(response, response_size,
                            "HTTP/1.1 200 OK\r\n"
                            "Content-Type: text/plain\r\n"
@@ -170,19 +116,19 @@ int process_request(int fd, char *response, size_t response_size) {
                            "%s",
                            echo_len, echo_str);
         if (ret < 0 || (size_t)ret >= response_size) {
-            printf("Failed to construct echo response.\n");
+            fprintf(stderr, "Response truncation in /echo/.\n");
             return -1;
         }
         return 0;
     }
-    else if (strcmp(path, "/") == 0 || strcmp(path, "/index") == 0) {
-        // Root or /index
+    // Root or /index
+    else if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index") == 0) {
         snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
         return 0;
     }
-    else if (strncmp(path, "/user-agent", 11) == 0) {
-        // If the path is /user-agent, return whatever was parsed from the User-Agent header
-        size_t ua_len = strlen(user_agent);
+    // /user-agent
+    else if (strncmp(req->path, "/user-agent", 11) == 0) {
+        size_t ua_len = strlen(req->user_agent);
 
         int ret = snprintf(response, response_size,
                            "HTTP/1.1 200 OK\r\n"
@@ -190,55 +136,152 @@ int process_request(int fd, char *response, size_t response_size) {
                            "Content-Length: %zu\r\n"
                            "\r\n"
                            "%s",
-                           ua_len, user_agent);
+                           ua_len, req->user_agent);
         if (ret < 0 || (size_t)ret >= response_size) {
-            printf("Failed to construct user-agent response.\n");
+            fprintf(stderr, "Response truncation in /user-agent.\n");
             return -1;
         }
         return 0;
     }
+    // Unknown path -> 404
     else {
-        // Unknown endpoint
-        snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+        snprintf(response, response_size,
+                 "HTTP/1.1 404 Not Found\r\n\r\n");
         return 0;
     }
+}
 
+/**
+ * @brief Thread function that handles a single client's request/response cycle.
+ */
+void* handle_client(void *arg)
+{
+    ClientData *client_data = (ClientData *)arg;
+    int fd = client_data->fd;
+
+    char response[BUFFER_SIZE];
+
+    // 1) Parse
+    HttpRequest req = parse_http_request(fd, response, sizeof(response));
+    // 2) Build
+    int build_result = build_http_response(&req, response, sizeof(response));
+    // 3) Send
+    if (build_result < 0) {
+        printf("Failed to build HTTP response.\n");
+    } else {
+        int bytes_sent = send(fd, response, strlen(response), 0);
+        if (bytes_sent == -1) {
+            printf("Send failed: %s \n", strerror(errno));
+        } else {
+            printf("Response sent successfully.\n");
+        }
+    }
+
+    close(fd);
+    free(client_data);
+    return NULL;
+}
+
+/**
+ * @brief Sets up the server, listens for connections in a loop, 
+ *        and spawns a new thread for each client.
+ *
+ * @param port The port number to listen on.
+ * @return int 0 on success, -1 on failure.
+ */
+int setup_server(int port) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        printf("Socket creation failed: %s...\n", strerror(errno));
+        return -1;
+    }
+
+    // Reuse address
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        printf("SO_REUSEADDR failed: %s \n", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
+
+    // Bind
+    struct sockaddr_in serv_addr = { 
+        .sin_family = AF_INET,
+        .sin_port   = htons(port),
+        .sin_addr   = { htonl(INADDR_ANY) },
+    };
+
+    if (bind(server_fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) != 0) {
+        printf("Bind failed: %s \n", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
+
+    // Listen
+    if (listen(server_fd, BACKLOG) != 0) {
+        printf("Listen failed: %s \n", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
+
+    printf("Server listening on port %d...\n", port);
+
+    // Main loop: accept new clients in separate threads
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        // Blocking accept
+        int fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (fd < 0) {
+            printf("Accept failed: %s\n", strerror(errno));
+            break;  // or continue, depending on your preference
+        }
+
+        printf("Client connected (fd=%d)\n", fd);
+
+        // Allocate a ClientData for this connection
+        ClientData *client_data = (ClientData *)malloc(sizeof(ClientData));
+        if (!client_data) {
+            printf("Memory allocation failed.\n");
+            close(fd);
+            continue;
+        }
+        client_data->fd = fd;
+
+        // Spawn a thread to handle the client
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, client_data) != 0) {
+            printf("Failed to create client thread: %s\n", strerror(errno));
+            close(fd);
+            free(client_data);
+            continue;
+        }
+        // Detach so it cleans up on its own
+        pthread_detach(tid);
+    }
+
+    // If we exit the loop, it means accept failed or some condition to stop
+    printf("Server shutting down...\n");
+    close(server_fd);
     return 0;
 }
 
-
+/**
+ * @brief Main entry point
+ */
 int main() {
-  // Disable output buffering
-  setbuf(stdout, NULL);
-  setbuf(stderr, NULL);
+    // Disable output buffering
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
 
-  // Setup the Server
-  int port = 4221;
-  int fd = setup_server(port);
-  if (fd == -1) {
-    printf("Failed to set up server.\n");
-    return 1;
-  }
+    int port = 4221;
+    if (setup_server(port) == -1) {
+        printf("Failed to set up server.\n");
+        return 1;
+    }
 
-  // Process the client's request
-  char response[BUFFER_SIZE];
-  if (process_request(fd, response, sizeof(response)) == -1) {
-      printf("Failed to process client request.\n");
-      close(fd);
-      return 1;
-  }
-
-  // Send response
-  int bytes_sent = send(fd, response, strlen(response), 0);
-  if (bytes_sent == -1){
-      printf("Send failed: %s \n", strerror(errno));
-      return 1;
-  } else {
-      printf("Response sent successfully.\n");
-  }
-
-  // Close Socket
-  close(fd);
-  return 0;
+    printf("Server closed.\n");
+    return 0;
 }
 
