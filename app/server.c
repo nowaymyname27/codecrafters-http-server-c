@@ -22,6 +22,7 @@ typedef struct {
     char method[METHOD_SIZE];
     char path[PATH_SIZE];
     char user_agent[UA_SIZE];
+    char file_path[PATH_SIZE];
     int  error;  // Non-zero if an error occurred during parsing
 } HttpRequest;
 
@@ -30,18 +31,19 @@ typedef struct {
  */
 typedef struct {
     int fd;
+    char file_path[PATH_SIZE];
 } ClientData;
 
 /**
  * @brief Reads and parses the HTTP request from the client socket (fd).
  *
  */
-HttpRequest parse_http_request(int fd, char *response, size_t response_size)
+HttpRequest parse_http_request(ClientData *client_data, char *response, size_t response_size)
 {
     HttpRequest request;
     memset(&request, 0, sizeof(HttpRequest));
 
-    int bytes_received = recv(fd, response, response_size - 1, 0);
+    int bytes_received = recv(client_data->fd, response, response_size - 1, 0);
     if (bytes_received <= 0) {
         fprintf(stderr, "recv() error (%d): %s\n", bytes_received, strerror(errno));
         request.error = 1; 
@@ -70,6 +72,10 @@ HttpRequest parse_http_request(int fd, char *response, size_t response_size)
             // End of headers
             break;
         }
+        if (strcmp(request.path, "/file/")) {
+            const char *file_name = request.path + 6;
+            strcpy(request.file_path, file_name);
+        }
         if (strncasecmp(line, "User-Agent:", 11) == 0) {
             const char *ua_start = line + 11;
             while (*ua_start == ' ' || *ua_start == '\t') {
@@ -87,7 +93,8 @@ HttpRequest parse_http_request(int fd, char *response, size_t response_size)
  * @brief Constructs an HTTP response based on the parsed HttpRequest data.
  *
  */
-int build_http_response(const HttpRequest *req, char *response, size_t response_size)
+int build_http_response(ClientData *client_data, const HttpRequest *req,
+                        char *response, size_t response_size)
 {
     if (req->error) {
         snprintf(response, response_size,
@@ -100,7 +107,6 @@ int build_http_response(const HttpRequest *req, char *response, size_t response_
                  "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
         return 0;
     }
-
     // /echo/{str}
     if (strncmp(req->path, "/echo/", 6) == 0) {
         const char *echo_str = req->path + 6;
@@ -119,11 +125,46 @@ int build_http_response(const HttpRequest *req, char *response, size_t response_
         }
         return 0;
     }
+    // /file
+    else if (strncmp(req->path, "/files/", 7) == 0) {
+        char file_path[PATH_SIZE];
+        snprintf(file_path, sizeof(file_path), "%s%s", 
+                 client_data->file_path, req->path + 7);
+        
+        printf("Filepath: %s\n", file_path);
+
+        FILE *file = fopen(file_path, "r");
+        if (file == NULL) {
+            perror("Error opening file");
+            snprintf(response, response_size,
+                 "HTTP/1.1 404 Not Found\r\n\r\n");
+            return 1;
+        }
+
+        char buffer[256];
+        
+        while (fgets(buffer, sizeof(buffer), file)) {
+          size_t file_len = strlen(buffer);
+          int ret = snprintf(response, response_size,
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: application/octet-stream\r\n"
+                           "Content-Length: %zu\r\n"
+                           "\r\n"
+                           "%s",
+                           file_len, buffer);
+          if (ret < 0 || (size_t)ret >= response_size) {
+              fprintf(stderr, "Response truncation in /files/.\n");
+              return -1;
+          }
+        }
+        return 0;
+    }
     // Root or /index
     else if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index") == 0) {
         snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
         return 0;
     }
+    
     // /user-agent
     else if (strncmp(req->path, "/user-agent", 11) == 0) {
         size_t ua_len = strlen(req->user_agent);
@@ -152,22 +193,21 @@ int build_http_response(const HttpRequest *req, char *response, size_t response_
 /**
  * @brief Thread function that handles a single client's request/response cycle.
  */
-void* handle_client(void *arg)
+void *handle_client(void *arg)
 {
     ClientData *client_data = (ClientData *)arg;
-    int fd = client_data->fd;
 
     char response[BUFFER_SIZE];
 
     // 1) Parse
-    HttpRequest req = parse_http_request(fd, response, sizeof(response));
+    HttpRequest req = parse_http_request(client_data, response, sizeof(response));
     // 2) Build
-    int build_result = build_http_response(&req, response, sizeof(response));
+    int build_result = build_http_response(client_data, &req, response, sizeof(response));
     // 3) Send
     if (build_result < 0) {
         printf("Failed to build HTTP response.\n");
     } else {
-        int bytes_sent = send(fd, response, strlen(response), 0);
+        int bytes_sent = send(client_data->fd, response, strlen(response), 0);
         if (bytes_sent == -1) {
             printf("Send failed: %s \n", strerror(errno));
         } else {
@@ -175,7 +215,6 @@ void* handle_client(void *arg)
         }
     }
 
-    close(fd);
     free(client_data);
     return NULL;
 }
@@ -187,7 +226,7 @@ void* handle_client(void *arg)
  * @param port The port number to listen on.
  * @return int 0 on success, -1 on failure.
  */
-int setup_server(int port) {
+int setup_server(int port, char *filepath) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         printf("Socket creation failed: %s...\n", strerror(errno));
@@ -239,13 +278,14 @@ int setup_server(int port) {
         printf("Client connected (fd=%d)\n", fd);
 
         // Allocate a ClientData for this connection
-        ClientData *client_data = (ClientData *)malloc(sizeof(ClientData));
+        ClientData *client_data = malloc(sizeof(ClientData));
         if (!client_data) {
             printf("Memory allocation failed.\n");
             close(fd);
             continue;
         }
         client_data->fd = fd;
+        strcpy(client_data->file_path, filepath);
 
         // Spawn a thread to handle the client
         pthread_t tid;
@@ -268,13 +308,22 @@ int setup_server(int port) {
 /**
  * @brief Main entry point
  */
-int main() {
-    // Disable output buffering
+int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
+    char filepath[PATH_SIZE] = {0};  // buffer for the directory path
+
+    // If you expect at least one CLI arg, handle it
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--directory") == 0 && i + 1 < argc) {
+            snprintf(filepath, sizeof(filepath), "%s", argv[i + 1]);
+            printf("This is the filepath stored: %s\n", filepath);
+        }
+    }
+
     int port = 4221;
-    if (setup_server(port) == -1) {
+    if (setup_server(port, filepath) == -1) {
         printf("Failed to set up server.\n");
         return 1;
     }
@@ -282,4 +331,5 @@ int main() {
     printf("Server closed.\n");
     return 0;
 }
+
 
