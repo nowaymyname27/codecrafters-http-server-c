@@ -11,9 +11,9 @@
 // Constants
 #define BUFFER_SIZE 1024
 #define METHOD_SIZE 8
-#define PATH_SIZE 256
+#define PATH_SIZE   256
 #define HEADER_SIZE 512
-#define BACKLOG 5
+#define BACKLOG     5
 
 /**
  * @brief A structure to hold all parsed request data.
@@ -23,8 +23,9 @@ typedef struct {
   char path[PATH_SIZE];
   char user_agent[HEADER_SIZE];
   char content_type[HEADER_SIZE];
+  char accept_encoding[HEADER_SIZE];
 
-  int content_length;
+  int  content_length;
   char body[BUFFER_SIZE];
 
   char file_path[PATH_SIZE];
@@ -35,33 +36,32 @@ typedef struct {
  * @brief Holds data about a client connection passed to each thread.
  */
 typedef struct {
-  int fd;
+  int  fd;
   char file_path[PATH_SIZE];
 } ClientData;
 
 /**
  * @brief Reads and parses the HTTP request from the client socket (fd).
- *
  */
 HttpRequest parse_http_request(ClientData *client_data, char *response,
-  size_t response_size)
+                               size_t response_size)
 {
   HttpRequest request;
   memset(&request, 0, sizeof(HttpRequest));
 
-  // 1) Read the first chunk (headers + possibly some or all of the body)
+  // 1) Read the first chunk (headers + possibly some/all of the body)
   int bytes_received = recv(client_data->fd, response, response_size - 1, 0);
   if (bytes_received <= 0) {
     fprintf(stderr, "recv() error (%d): %s\n", bytes_received, strerror(errno));
-    request.error = 1; 
+    request.error = 1;
     return request;
   }
-  // Null-terminate so we can use string functions
+  // Null-terminate for safe string ops
   response[bytes_received] = '\0';
 
   printf("Request:\r\n%s\r\n", response);
 
-  // 2) Locate the blank line that marks the end of headers
+  // 2) Locate the blank line that marks end of headers
   char *body_start_ptr = strstr(response, "\r\n\r\n");
   int body_in_buffer = 0;
 
@@ -74,7 +74,6 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
     body_start_ptr += 4;
 
     body_in_buffer = bytes_received - (int)(body_start_ptr - response);
-
     if (body_in_buffer > 0) {
       memcpy(request.body, body_start_ptr, body_in_buffer);
       request.body[body_in_buffer] = '\0';
@@ -120,7 +119,16 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
       strncpy(request.content_type, ct_start, HEADER_SIZE - 1);
       request.content_type[HEADER_SIZE - 1] = '\0';
     }
+    else if (strncasecmp(line, "Accept-Encoding:", 16) == 0) {
+      const char *encoding = line + 16;
+      while (*encoding == ' ' || *encoding == '\t') {
+        encoding++;
+      }
+      strncpy(request.accept_encoding, encoding, HEADER_SIZE - 1);
+      request.accept_encoding[HEADER_SIZE - 1] = '\0';
+    }
 
+    // If path starts with /files/, store the filename in request.file_path
     if (strncmp(request.path, "/files/", 7) == 0) {
       const char *file_name = request.path + 7;
       strncpy(request.file_path, file_name, sizeof(request.file_path) - 1);
@@ -128,13 +136,12 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
     }
   }
 
-  // 5) Read remaining body
+  // 5) Read remaining body if needed
   if (request.content_length > body_in_buffer) {
     int still_needed = request.content_length - body_in_buffer;
-    int extra_bytes = recv(client_data->fd,
-      request.body + body_in_buffer,
-      still_needed,
-      0);
+    int extra_bytes  = recv(client_data->fd,
+                            request.body + body_in_buffer,
+                            still_needed, 0);
     if (extra_bytes > 0) {
       body_in_buffer += extra_bytes;
       request.body[body_in_buffer] = '\0';
@@ -147,144 +154,219 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
   return request;
 }
 
-/**
- * @brief Constructs an HTTP response based on the parsed HttpRequest data.
- *
+/* 
+ * ==========================================================================
+ *                       RESPONSE HANDLER FUNCTIONS
+ * ==========================================================================
+ * Below, there are small functions that handle specific routes.
+ * They build the HTTP response string and return an int.
+ * Return 0 means success, non-zero could indicate an error.
  */
-int build_http_response(ClientData *client_data, const HttpRequest *req,
-                        char *response, size_t response_size)
-{
-  if (req->error) {
-    snprintf(response, response_size,
-             "HTTP/1.1 400 Bad Request\r\n\r\n");
-    return 0;
-  }
 
-  if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") != 0) {
-    snprintf(response, response_size,
-             "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-    return 0;
-  }
-  // /echo/{str}
-  if (strncmp(req->path, "/echo/", 6) == 0) {
-    const char *echo_str = req->path + 6;
-    size_t echo_len = strlen(echo_str);
+/**
+ * @brief Sends an HTTP 400 response.
+ */
+static int handle_bad_request(char *response, size_t response_size) {
+  snprintf(response, response_size, "HTTP/1.1 400 Bad Request\r\n\r\n");
+  return 0;
+}
 
+/**
+ * @brief Sends an HTTP 405 response.
+ */
+static int handle_method_not_allowed(char *response, size_t response_size) {
+  snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+  return 0;
+}
+
+/**
+ * @brief Sends an HTTP 404 response.
+ */
+static int handle_not_found(char *response, size_t response_size) {
+  snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+  return 0;
+}
+
+/**
+ * @brief Handles /echo/ route (GET).
+ */
+static int handle_echo(const HttpRequest *req, char *response, size_t response_size) {
+  const char *echo_str = req->path + 6; // skip "/echo/"
+  size_t echo_len = strlen(echo_str);
+  if (strcmp(req->accept_encoding, "gzip") != 0) {
     int ret = snprintf(response, response_size,
-                       "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: text/plain\r\n"
-                       "Content-Length: %zu\r\n"
-                       "\r\n"
-                       "%s",
-                       echo_len, echo_str);
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n"
+                     "%s",
+                     echo_len, echo_str);
     if (ret < 0 || (size_t)ret >= response_size) {
       fprintf(stderr, "Response truncation in /echo/.\n");
       return -1;
     }
-      return 0;
+  } else {
+    int ret = snprintf(response, response_size,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Encoding: %s\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n"
+                     "%s",
+                     req->accept_encoding,echo_len, echo_str);
+    if (ret < 0 || (size_t)ret >= response_size) {
+      fprintf(stderr, "Response truncation in /echo/.\n");
+      return -1;
+    }
   }
-  // POST
-  else if (strcmp(req->method, "POST") == 0 && 
-           strncmp(req->path, "/files/", 7) == 0) {
-    // Construct the file path
-    char file_path[PATH_SIZE];
-    snprintf(file_path, sizeof(file_path), "%s%s", 
-             client_data->file_path, req->path + 7);
-    printf("Writing file: %s\n", file_path);
-
-    FILE *file = fopen(file_path, "w");
-    if (!file) {
-      perror("Error opening file");
-      snprintf(response, response_size,
-               "HTTP/1.1 500 Not Found\r\n\r\n");
-      return 1;
-    }
-
-    size_t bytes_written = fwrite(req->body, 1, req->content_length, file);
-    if (bytes_written < (size_t)req->content_length) {
-      perror("Error writing to file");
-      fclose(file);
-      snprintf(response, response_size,
-               "HTTP/1.1 500 Internal Server Error\r\n\r\n");
-      return 1;
-    }
-    fclose(file);
-    snprintf(response, response_size,
-             "HTTP/1.1 201 Created\r\n\r\n");
     return 0;
+}
+
+/**
+ * @brief Handles GET /files/<filename>
+ */
+static int handle_files_get(ClientData *client_data, const HttpRequest *req,
+                            char *response, size_t response_size)
+{
+  // Construct the file path
+  char file_path[PATH_SIZE];
+  snprintf(file_path, sizeof(file_path), "%s%s",
+           client_data->file_path, req->file_path);
+  printf("Filepath: %s\n", file_path);
+
+  FILE *file = fopen(file_path, "r");
+  if (file == NULL) {
+    perror("Error opening file");
+    snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+    return 1;
   }
 
-  // /file
-  else if (strncmp(req->path, "/files/", 7) == 0) {
-    char file_path[PATH_SIZE];
-    snprintf(file_path, sizeof(file_path), "%s%s", 
-             client_data->file_path, req->path + 7);
-    printf("Filepath: %s\n", file_path);
-
-    FILE *file = fopen(file_path, "r");
-    if (file == NULL) {
-      perror("Error opening file");
-      snprintf(response, response_size,
-               "HTTP/1.1 404 Not Found\r\n\r\n");
-      return 1;
-    }
-
-    char buffer[256];
-    size_t file_len;
-
-    if (fgets(buffer, sizeof(buffer), file)) {
-      file_len = strlen(buffer);
-      int ret = snprintf(response, response_size,
-                         "HTTP/1.1 200 OK\r\n"
-                         "Content-Type: application/octet-stream\r\n"
-                         "Content-Length: %zu\r\n"
-                         "\r\n"
-                         "%s",
-                         file_len, buffer);
-      if (ret < 0 || (size_t)ret >= response_size) {
-        fprintf(stderr, "Response truncation in /files/.\n");
-        fclose(file);
-        return -1;
-      }
-    } else {
-      snprintf(response, response_size,
-              "HTTP/1.1 200 OK\r\n"
-              "Content-Type: application/octet-stream\r\n"
-              "Content-Length: 0\r\n"
-              "\r\n");
-    }
-    fclose(file);
-    return 0;
-  }
-  // Root or /index
-  else if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index") == 0) {
-    snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
-    return 0;
-  }
-
-  // /user-agent
-  else if (strncmp(req->path, "/user-agent", 11) == 0) {
-    size_t ua_len = strlen(req->user_agent);
-
+  // For simplicity, read up to one line and send it back
+  char buffer[256];
+  if (fgets(buffer, sizeof(buffer), file)) {
+    size_t file_len = strlen(buffer);
     int ret = snprintf(response, response_size,
                        "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: text/plain\r\n"
+                       "Content-Type: application/octet-stream\r\n"
                        "Content-Length: %zu\r\n"
                        "\r\n"
                        "%s",
-                       ua_len, req->user_agent);
+                       file_len, buffer);
     if (ret < 0 || (size_t)ret >= response_size) {
-      fprintf(stderr, "Response truncation in /user-agent.\n");
+      fprintf(stderr, "Response truncation in /files/.\n");
+      fclose(file);
       return -1;
     }
-    return 0;
-    }
-  // Unknown path -> 404
-  else {
+  } else {
+    // File is empty or read error
     snprintf(response, response_size,
-             "HTTP/1.1 404 Not Found\r\n\r\n");
-    return 0;
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: application/octet-stream\r\n"
+             "Content-Length: 0\r\n"
+             "\r\n");
   }
+  fclose(file);
+  return 0;
+}
+
+/**
+ * @brief Handles POST /files/<filename>
+ */
+static int handle_files_post(ClientData *client_data, const HttpRequest *req,
+                             char *response, size_t response_size)
+{
+  // Construct the file path
+  char file_path[PATH_SIZE];
+  snprintf(file_path, sizeof(file_path), "%s%s",
+           client_data->file_path, req->file_path);
+  printf("Writing file: %s\n", file_path);
+
+  FILE *file = fopen(file_path, "w");
+  if (!file) {
+    perror("Error opening file");
+    snprintf(response, response_size, "HTTP/1.1 500 Not Found\r\n\r\n");
+    return 1;
+  }
+
+  size_t bytes_written = fwrite(req->body, 1, req->content_length, file);
+  if (bytes_written < (size_t)req->content_length) {
+    perror("Error writing to file");
+    fclose(file);
+    snprintf(response, response_size, "HTTP/1.1 500 Internal Server Error\r\n\r\n");
+    return 1;
+  }
+  fclose(file);
+  snprintf(response, response_size, "HTTP/1.1 201 Created\r\n\r\n");
+  return 0;
+}
+
+/**
+ * @brief Handles / (root) or /index
+ */
+static int handle_root_index(char *response, size_t response_size)
+{
+  snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
+  return 0;
+}
+
+/**
+ * @brief Handles /user-agent
+ */
+static int handle_user_agent(const HttpRequest *req, char *response, size_t response_size)
+{
+  size_t ua_len = strlen(req->user_agent);
+
+  int ret = snprintf(response, response_size,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "Content-Length: %zu\r\n"
+                     "\r\n"
+                     "%s",
+                     ua_len, req->user_agent);
+  if (ret < 0 || (size_t)ret >= response_size) {
+    fprintf(stderr, "Response truncation in /user-agent.\n");
+    return -1;
+  }
+  return 0;
+}
+
+/**
+ * @brief Constructs an HTTP response based on the parsed HttpRequest data.
+ */
+int build_http_response(ClientData *client_data, const HttpRequest *req,
+                        char *response, size_t response_size)
+{
+  // 1) Check for early errors
+  if (req->error) {
+    return handle_bad_request(response, response_size);
+  }
+
+  // 2) Check if method is allowed
+  if (strcmp(req->method, "GET") != 0 && strcmp(req->method, "POST") != 0) {
+    return handle_method_not_allowed(response, response_size);
+  }
+
+  // 3) Route by path + method
+  if (strcmp(req->path, "/") == 0 || strcmp(req->path, "/index") == 0) {
+    return handle_root_index(response, response_size);
+  }
+  else if (strncmp(req->path, "/echo/", 6) == 0 && strcmp(req->method, "GET") == 0) {
+    return handle_echo(req, response, response_size);
+  }
+  else if (strncmp(req->path, "/user-agent", 11) == 0 && strcmp(req->method, "GET") == 0) {
+    return handle_user_agent(req, response, response_size);
+  }
+  else if (strncmp(req->path, "/files/", 7) == 0) {
+    // We have two possible methods: GET or POST
+    if (strcmp(req->method, "GET") == 0) {
+      return handle_files_get(client_data, req, response, response_size);
+    } else if (strcmp(req->method, "POST") == 0) {
+      return handle_files_post(client_data, req, response, response_size);
+    }
+  }
+
+  // 4) If nothing matched, 404
+  return handle_not_found(response, response_size);
 }
 
 /**
@@ -297,11 +379,12 @@ void *handle_client(void *arg)
   char response[BUFFER_SIZE];
 
   // 1) Parse
-  HttpRequest req = parse_http_request(client_data, response,
-                                       sizeof(response));
+  HttpRequest req = parse_http_request(client_data, response, sizeof(response));
+
   // 2) Build
   int build_result = build_http_response(client_data, &req,
                                          response, sizeof(response));
+
   // 3) Send
   if (build_result < 0) {
     printf("Failed to build HTTP response.\n");
@@ -319,7 +402,7 @@ void *handle_client(void *arg)
 }
 
 /**
- * @brief Sets up the server, listens for connections in a loop, 
+ * @brief Sets up the server, listens for connections in a loop,
  *        and spawns a new thread for each client.
  *
  * @param port The port number to listen on.
@@ -342,7 +425,7 @@ int setup_server(int port, char *filepath) {
   }
 
   // Bind
-  struct sockaddr_in serv_addr = { 
+  struct sockaddr_in serv_addr = {
     .sin_family = AF_INET,
     .sin_port   = htons(port),
     .sin_addr   = { htonl(INADDR_ANY) },
@@ -432,5 +515,4 @@ int main(int argc, char *argv[]) {
   printf("Server closed.\n");
   return 0;
 }
-
 
