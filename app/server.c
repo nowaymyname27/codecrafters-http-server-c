@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <zlib.h>  // <-- important for gzip
 
 // Constants
 #define BUFFER_SIZE 1024
@@ -39,6 +40,51 @@ typedef struct {
   int  fd;
   char file_path[PATH_SIZE];
 } ClientData;
+
+/**
+ * @brief gzip_compress_gzip: Compresses raw data into a **gzip**-formatted byte stream.
+ *
+ * @param in_data   Pointer to uncompressed data
+ * @param in_size   Size of uncompressed data
+ * @param out_data  Pointer to buffer for compressed data
+ * @param out_size  Size of out_data buffer (maximum)
+ * @return size_t   The actual compressed size on success, or 0 on failure
+ */
+static size_t gzip_compress_gzip(const unsigned char *in_data, size_t in_size,
+                                 unsigned char *out_data, size_t out_size)
+{
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+
+    // 15 + 16 to produce a gzip header/trailer (instead of raw DEFLATE or zlib format)
+    int windowBits = 15 + 16;
+    int memLevel   = 8; // default
+    int ret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           windowBits, memLevel, Z_DEFAULT_STRATEGY);
+    if (ret != Z_OK) {
+        fprintf(stderr, "deflateInit2() failed with code %d\n", ret);
+        return 0;
+    }
+
+    strm.next_in   = (Bytef *)in_data;
+    strm.avail_in  = (uInt)in_size;
+    strm.next_out  = (Bytef *)out_data;
+    strm.avail_out = (uInt)out_size;
+
+    // Compress
+    ret = deflate(&strm, Z_FINISH);
+    if (ret != Z_STREAM_END && ret != Z_OK) {
+        fprintf(stderr, "deflate() failed with code %d\n", ret);
+        deflateEnd(&strm);
+        return 0;
+    }
+
+    // How many bytes we wrote
+    size_t compressed_size = out_size - strm.avail_out;
+
+    deflateEnd(&strm);
+    return compressed_size;
+}
 
 /**
  * @brief Reads and parses the HTTP request from the client socket (fd).
@@ -124,8 +170,7 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
       while (*encoding == ' ' || *encoding == '\t') {
         encoding++;
       }
-
-      // Copy to a temporary buffer to avoid modifying the original line
+      // Copy to a temporary buffer so we can tokenize by comma
       char temp_encoding[HEADER_SIZE];
       strncpy(temp_encoding, encoding, HEADER_SIZE - 1);
       temp_encoding[HEADER_SIZE - 1] = '\0';
@@ -133,18 +178,20 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
       // Tokenize by comma for multiple encodings
       char *enc_token = strtok(temp_encoding, ",");
       while (enc_token != NULL) {
+        // Skip leading spaces
         while (*enc_token == ' ' || *enc_token == '\t') {
-          enc_token++;  // Skip leading spaces
+          enc_token++;
         }
-      printf("Encoding: %s\n", enc_token);  // Or store it in a list/array
-      if (strcmp(enc_token, "gzip") == 0) {
-        strncpy(request.accept_encoding, enc_token, HEADER_SIZE - 1);
-        request.accept_encoding[HEADER_SIZE - 1] = '\0';
-      }
-      enc_token = strtok(NULL, ",");  // Get the next encoding
-      }
-  }
+        printf("Encoding: %s\n", enc_token);
 
+        // If this token is "gzip", store in request.accept_encoding
+        if (strcmp(enc_token, "gzip") == 0) {
+          strncpy(request.accept_encoding, enc_token, HEADER_SIZE - 1);
+          request.accept_encoding[HEADER_SIZE - 1] = '\0';
+        }
+        enc_token = strtok(NULL, ",");
+      }
+    }
 
     // If path starts with /files/, store the filename in request.file_path
     if (strncmp(request.path, "/files/", 7) == 0) {
@@ -176,68 +223,105 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
  * ==========================================================================
  *                       RESPONSE HANDLER FUNCTIONS
  * ==========================================================================
- * Below, there are small functions that handle specific routes.
- * They build the HTTP response string and return an int.
- * Return 0 means success, non-zero could indicate an error.
+ * 
+ * Each returns a non-negative integer = total length of the HTTP response 
+ * in `response`, or -1 on error.
  */
 
 /**
  * @brief Sends an HTTP 400 response.
  */
 static int handle_bad_request(char *response, size_t response_size) {
-  snprintf(response, response_size, "HTTP/1.1 400 Bad Request\r\n\r\n");
-  return 0;
+  int ret = snprintf(response, response_size, "HTTP/1.1 400 Bad Request\r\n\r\n");
+  return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
 }
 
 /**
  * @brief Sends an HTTP 405 response.
  */
 static int handle_method_not_allowed(char *response, size_t response_size) {
-  snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-  return 0;
+  int ret = snprintf(response, response_size, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+  return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
 }
 
 /**
  * @brief Sends an HTTP 404 response.
  */
 static int handle_not_found(char *response, size_t response_size) {
-  snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
-  return 0;
+  int ret = snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
+  return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
 }
 
 /**
- * @brief Handles /echo/ route (GET).
+ * @brief Handles /echo/{str} route (GET).
+ *        If `Accept-Encoding` is gzip, produce a valid gzip stream.
+ *
+ * @return int  -1 on error, or the total length of the HTTP response built
  */
 static int handle_echo(const HttpRequest *req, char *response, size_t response_size) {
-  const char *echo_str = req->path + 6; // skip "/echo/"
+  // The raw string: everything after /echo/
+  const char *echo_str = req->path + 6; 
   size_t echo_len = strlen(echo_str);
+
+  // Check if client wants gzip
   if (strcmp(req->accept_encoding, "gzip") != 0) {
+    // Send uncompressed text
     int ret = snprintf(response, response_size,
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: text/plain\r\n"
-                     "Content-Length: %zu\r\n"
-                     "\r\n"
-                     "%s",
-                     echo_len, echo_str);
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %zu\r\n"
+                       "\r\n"
+                       "%s",
+                       echo_len, echo_str);
     if (ret < 0 || (size_t)ret >= response_size) {
       fprintf(stderr, "Response truncation in /echo/.\n");
       return -1;
     }
-  } else {
-    int ret = snprintf(response, response_size,
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Encoding: %s\r\n"
-                     "Content-Type: text/plain\r\n"
-                     "Content-Length: %zu\r\n"
-                     "\r\n"
-                     "%s",
-                     req->accept_encoding,echo_len, echo_str);
-    if (ret < 0 || (size_t)ret >= response_size) {
-      fprintf(stderr, "Response truncation in /echo/.\n");
+    return ret; // total length of the plain text response
+  } 
+  else {
+    // GZIP compression path
+    unsigned char compressed[BUFFER_SIZE];
+    memset(compressed, 0, sizeof(compressed));
+
+    // Produce gzip data
+    size_t compressed_size = gzip_compress_gzip(
+        (const unsigned char*)echo_str,  // input data
+        echo_len,                        // input size
+        compressed,                      // output buffer
+        sizeof(compressed)               // output buffer size
+    );
+
+    if (compressed_size == 0) {
+      fprintf(stderr, "Gzip compression failed.\n");
       return -1;
     }
+
+    // Build the response headers
+    int ret = snprintf(response, response_size,
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Encoding: gzip\r\n"
+                       "Content-Type: text/plain\r\n"
+                       "Content-Length: %zu\r\n"
+                       "\r\n",
+                       compressed_size);
+    if (ret < 0 || (size_t)ret >= response_size) {
+      fprintf(stderr, "Response header truncation in /echo/.\n");
+      return -1;
+    }
+
+    size_t header_len = (size_t)ret;
+    // Check space for compressed data
+    if (header_len + compressed_size > response_size) {
+      fprintf(stderr, "Not enough space to append compressed data.\n");
+      return -1;
+    }
+    // Copy the compressed data into the response buffer
+    memcpy(response + header_len, compressed, compressed_size);
+
+    // Return total length = headers + compressed data
+    return (int)(header_len + compressed_size);
   }
-    return 0;
 }
 
 /**
@@ -255,14 +339,15 @@ static int handle_files_get(ClientData *client_data, const HttpRequest *req,
   FILE *file = fopen(file_path, "r");
   if (file == NULL) {
     perror("Error opening file");
-    snprintf(response, response_size, "HTTP/1.1 404 Not Found\r\n\r\n");
-    return 1;
+    return handle_not_found(response, response_size); 
   }
 
   // For simplicity, read up to one line and send it back
   char buffer[256];
   if (fgets(buffer, sizeof(buffer), file)) {
     size_t file_len = strlen(buffer);
+    fclose(file);
+
     int ret = snprintf(response, response_size,
                        "HTTP/1.1 200 OK\r\n"
                        "Content-Type: application/octet-stream\r\n"
@@ -272,19 +357,20 @@ static int handle_files_get(ClientData *client_data, const HttpRequest *req,
                        file_len, buffer);
     if (ret < 0 || (size_t)ret >= response_size) {
       fprintf(stderr, "Response truncation in /files/.\n");
-      fclose(file);
       return -1;
     }
+    return ret;
   } else {
     // File is empty or read error
-    snprintf(response, response_size,
+    fclose(file);
+
+    int ret = snprintf(response, response_size,
              "HTTP/1.1 200 OK\r\n"
              "Content-Type: application/octet-stream\r\n"
              "Content-Length: 0\r\n"
              "\r\n");
+    return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
   }
-  fclose(file);
-  return 0;
 }
 
 /**
@@ -302,20 +388,22 @@ static int handle_files_post(ClientData *client_data, const HttpRequest *req,
   FILE *file = fopen(file_path, "w");
   if (!file) {
     perror("Error opening file");
-    snprintf(response, response_size, "HTTP/1.1 500 Not Found\r\n\r\n");
-    return 1;
+    return snprintf(response, response_size, 
+                    "HTTP/1.1 500 Not Found\r\n\r\n");
   }
 
   size_t bytes_written = fwrite(req->body, 1, req->content_length, file);
+  fclose(file);
+
   if (bytes_written < (size_t)req->content_length) {
     perror("Error writing to file");
-    fclose(file);
-    snprintf(response, response_size, "HTTP/1.1 500 Internal Server Error\r\n\r\n");
-    return 1;
+    int ret = snprintf(response, response_size,
+                       "HTTP/1.1 500 Internal Server Error\r\n\r\n");
+    return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
   }
-  fclose(file);
-  snprintf(response, response_size, "HTTP/1.1 201 Created\r\n\r\n");
-  return 0;
+
+  int ret = snprintf(response, response_size, "HTTP/1.1 201 Created\r\n\r\n");
+  return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
 }
 
 /**
@@ -323,8 +411,8 @@ static int handle_files_post(ClientData *client_data, const HttpRequest *req,
  */
 static int handle_root_index(char *response, size_t response_size)
 {
-  snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
-  return 0;
+  int ret = snprintf(response, response_size, "HTTP/1.1 200 OK\r\n\r\n");
+  return (ret < 0 || (size_t)ret >= response_size) ? -1 : ret;
 }
 
 /**
@@ -345,11 +433,12 @@ static int handle_user_agent(const HttpRequest *req, char *response, size_t resp
     fprintf(stderr, "Response truncation in /user-agent.\n");
     return -1;
   }
-  return 0;
+  return ret;
 }
 
 /**
  * @brief Constructs an HTTP response based on the parsed HttpRequest data.
+ * @return int - the total length of the response, or -1 on error
  */
 int build_http_response(ClientData *client_data, const HttpRequest *req,
                         char *response, size_t response_size)
@@ -399,19 +488,19 @@ void *handle_client(void *arg)
   // 1) Parse
   HttpRequest req = parse_http_request(client_data, response, sizeof(response));
 
-  // 2) Build
-  int build_result = build_http_response(client_data, &req,
-                                         response, sizeof(response));
+  // 2) Build -> returns length of response, or -1 on error
+  int build_len = build_http_response(client_data, &req, response, sizeof(response));
 
   // 3) Send
-  if (build_result < 0) {
+  if (build_len < 0) {
     printf("Failed to build HTTP response.\n");
   } else {
-    int bytes_sent = send(client_data->fd, response, strlen(response), 0);
+    // Now we have the exact length of the final response (including compressed data if any)
+    int bytes_sent = send(client_data->fd, response, build_len, 0);
     if (bytes_sent == -1) {
       printf("Send failed: %s \n", strerror(errno));
     } else {
-      printf("Response sent successfully.\n");
+      printf("Response sent successfully (%d bytes).\n", bytes_sent);
     }
   }
 
@@ -480,21 +569,21 @@ int setup_server(int port, char *filepath) {
     printf("Client connected (fd=%d)\n", fd);
 
     // Allocate a ClientData for this connection
-    ClientData *client_data = malloc(sizeof(ClientData));
-    if (!client_data) {
+    ClientData *cdata = malloc(sizeof(ClientData));
+    if (!cdata) {
       printf("Memory allocation failed.\n");
       close(fd);
       continue;
     }
-    client_data->fd = fd;
-    strcpy(client_data->file_path, filepath);
+    cdata->fd = fd;
+    strcpy(cdata->file_path, filepath);
 
     // Spawn a thread to handle the client
     pthread_t tid;
-    if (pthread_create(&tid, NULL, handle_client, client_data) != 0) {
+    if (pthread_create(&tid, NULL, handle_client, cdata) != 0) {
       printf("Failed to create client thread: %s\n", strerror(errno));
       close(fd);
-      free(client_data);
+      free(cdata);
       continue;
     }
     // Detach so it cleans up on its own
