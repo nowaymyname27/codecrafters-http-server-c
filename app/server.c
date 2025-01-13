@@ -124,9 +124,27 @@ HttpRequest parse_http_request(ClientData *client_data, char *response,
       while (*encoding == ' ' || *encoding == '\t') {
         encoding++;
       }
-      strncpy(request.accept_encoding, encoding, HEADER_SIZE - 1);
-      request.accept_encoding[HEADER_SIZE - 1] = '\0';
-    }
+
+      // Copy to a temporary buffer to avoid modifying the original line
+      char temp_encoding[HEADER_SIZE];
+      strncpy(temp_encoding, encoding, HEADER_SIZE - 1);
+      temp_encoding[HEADER_SIZE - 1] = '\0';
+
+      // Tokenize by comma for multiple encodings
+      char *enc_token = strtok(temp_encoding, ",");
+      while (enc_token != NULL) {
+        while (*enc_token == ' ' || *enc_token == '\t') {
+          enc_token++;  // Skip leading spaces
+        }
+      printf("Encoding: %s\n", enc_token);  // Or store it in a list/array
+      if (strcmp(enc_token, "gzip") == 0) {
+        strncpy(request.accept_encoding, enc_token, HEADER_SIZE - 1);
+        request.accept_encoding[HEADER_SIZE - 1] = '\0';
+      }
+      enc_token = strtok(NULL, ",");  // Get the next encoding
+      }
+  }
+
 
     // If path starts with /files/, store the filename in request.file_path
     if (strncmp(request.path, "/files/", 7) == 0) {
